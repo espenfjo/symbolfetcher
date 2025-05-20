@@ -1,7 +1,13 @@
 use exe::{Buffer, Castable, DebugDirectory, VecPE};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 
 pub struct Windows {
-    pub path: std::path::PathBuf,
+    path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -22,89 +28,67 @@ struct DDRaw {
 unsafe impl Castable for DDRaw {}
 
 const MIN_PDB_NAME_LEN: usize = 4;
-
-fn extract_debug_name(name: &[u8]) -> Option<String> {
-    let name_end = name.iter().position(|&b| b == 0)?;
-    String::from_utf8(name[..name_end].to_vec()).ok()
-}
-
-fn encode_guid(wg: &[u8; 16]) -> String {
-    hex::encode([
-        wg[3], wg[2], wg[1], wg[0], wg[5], wg[4], wg[7], wg[6], wg[8], wg[9], wg[10], wg[11],
-        wg[12], wg[13], wg[14], wg[15],
-    ])
-    .to_uppercase()
-}
-
-impl PdbMeta {
-    pub fn download(&self) -> Option<Vec<u8>> {
-        let url = format!(
-            "https://msdl.microsoft.com/download/symbols/{}/{}{}/{}",
-            self.name, self.guid, self.age, self.name
-        );
-        tracing::info!("Generated download URL: {}", url);
-
-        let mut attempts = 0;
-        let max_attempts = 5;
-        let mut delay = std::time::Duration::from_secs(1);
-        while attempts < max_attempts {
-            match reqwest::blocking::get(&url) {
-                Ok(response) => {
-                    tracing::info!("Successfully fetched data from URL");
-                    return Some(response.bytes().unwrap_or_default().to_vec());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Attempt {} failed to fetch data: {}. Retrying in {:?}...",
-                        attempts + 1,
-                        e,
-                        delay
-                    );
-                    std::thread::sleep(delay);
-                    delay *= 2; // Exponential backoff
-                    attempts += 1;
-                }
-            }
-        }
-        tracing::error!(
-            "Failed to fetch data from URL after {} attempts",
-            max_attempts
-        );
-        None
-    }
-}
+const ALLOWED_EXTENSIONS: &[&str] = &["dll", "exe", "sys", "drv", "cpl", "mui", "ocx"];
 
 impl Windows {
-    pub fn new(path: std::path::PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         tracing::info!("Creating Windows instance with path: {}", path.display());
         Self { path }
     }
 
-    pub fn get_path(&self) -> &std::path::Path {
+    pub fn get_path(&self) -> &Path {
         &self.path
     }
 
+    /// Fetches PDB metadata from files in the System32 directory.
     pub fn fetch_system32_pdbs(&self) -> Result<Vec<PdbMeta>, std::io::Error> {
         tracing::info!("Fetching system32 PDBs from: {}", self.path.display());
         let files = self.get_files_in_system32()?;
-        let hnp = self.get_hash_and_pdb_names(&files);
-        Ok(hnp)
-    }
-    fn get_hash_and_pdb_names(&self, files: &[std::path::PathBuf]) -> Vec<PdbMeta> {
-        tracing::info!("Extracting hash and PDB names from files");
-        let mut hnps = Vec::new();
-        for file in files {
-            let hnp = self.get_hash_and_pdb_name(file);
-            if hnp.is_none() {
-                tracing::warn!("No PDB found for file: {}", file.display());
-                continue;
-            }
-            hnps.push(hnp.unwrap());
-        }
-        hnps
+        let pdbs = files
+            .into_iter()
+            .filter_map(|file| match self.get_hash_and_pdb_name(&file) {
+                Some(pdb) => Some(pdb),
+                None => {
+                    tracing::warn!("No PDB found for file: {}", file.display());
+                    None
+                }
+            })
+            .collect();
+        Ok(pdbs)
     }
 
-    fn get_hash_and_pdb_name(&self, file: &std::path::Path) -> Option<PdbMeta> {
+    fn get_files_in_system32(&self) -> Result<Vec<PathBuf>, std::io::Error> {
+        let system32_path = self.path.join("System32");
+        tracing::info!("Listing files in System32: {}", system32_path.display());
+
+        fs::read_dir(system32_path)?
+            .filter_map(|entry_result| match entry_result {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(Self::is_allowed_extension)
+                        .unwrap_or(false)
+                    {
+                        tracing::debug!("File accepted: {}", path.display());
+                        Some(Ok(path))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            })
+            .collect()
+    }
+
+    fn is_allowed_extension(ext: &str) -> bool {
+        ALLOWED_EXTENSIONS
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(ext))
+    }
+
+    fn get_hash_and_pdb_name(&self, file: &Path) -> Option<PdbMeta> {
         let image = VecPE::from_file(exe::PEType::Disk, file).ok()?;
         let dir = DebugDirectory::parse(&image).ok()?;
         let dd = image
@@ -116,55 +100,75 @@ impl Windows {
             tracing::warn!("PDB name too short in file: {}", file.display());
             return None;
         }
-
-        let debug_guid = encode_guid(&dd.guid);
-        let debug_age = dd.age;
+        let age = dd.age;
 
         tracing::debug!(
             "Debug Name: {}, Debug GUID: {}, Debug Age: {}",
             debug_name,
-            debug_guid,
-            debug_age
+            encode_guid(&dd.guid),
+            age
         );
 
         Some(PdbMeta {
             name: debug_name,
-            guid: debug_guid,
-            age: debug_age,
+            guid: encode_guid(&dd.guid),
+            age: dd.age,
         })
     }
+}
 
-    fn get_files_in_system32(&self) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
-        let system32_path = self.path.join("System32");
-        tracing::info!("Listing files in System32: {}", system32_path.display());
+impl PdbMeta {
+    /// Downloads the PDB file via a retrying http request.
+    pub fn download(&self) -> Option<Vec<u8>> {
+        let url = format!(
+            "https://msdl.microsoft.com/download/symbols/{}/{}{}/{}",
+            self.name, self.guid, self.age, self.name
+        );
+        tracing::info!("Generated download URL: {}", url);
 
-        std::fs::read_dir(system32_path)?
-            .map(
-                |entry_result| -> Result<Option<std::path::PathBuf>, std::io::Error> {
-                    let entry = entry_result?;
-                    let path = entry.path();
-                    if path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| {
-                            ext.eq_ignore_ascii_case("dll")
-                                || ext.eq_ignore_ascii_case("exe")
-                                || ext.eq_ignore_ascii_case("sys")
-                                || ext.eq_ignore_ascii_case("drv")
-                                || ext.eq_ignore_ascii_case("cpl")
-                                || ext.eq_ignore_ascii_case("mui")
-                                || ext.eq_ignore_ascii_case("ocx")
-                        })
-                        .unwrap_or(false)
-                    {
-                        tracing::debug!("DLL file found: {}", path.display());
-                        Ok(Some(path))
-                    } else {
-                        Ok(None)
-                    }
-                },
-            )
-            .collect::<Result<Vec<Option<std::path::PathBuf>>, std::io::Error>>()
-            .map(|opts| opts.into_iter().flatten().collect())
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let mut delay = Duration::from_secs(1);
+
+        while attempts < max_attempts {
+            match reqwest::blocking::get(&url) {
+                Ok(response) => {
+                    tracing::info!("Successfully fetched data from URL");
+                    return Some(response.bytes().unwrap_or_default().to_vec());
+                }
+                Err(e) => {
+                    attempts += 1;
+                    tracing::warn!(
+                        "Attempt {} failed to fetch data: {}. Retrying in {:?}...",
+                        attempts,
+                        e,
+                        delay
+                    );
+                    thread::sleep(delay);
+                    delay *= 2; // Exponential backoff
+                }
+            }
+        }
+        tracing::error!(
+            "Failed to fetch data from URL after {} attempts",
+            max_attempts
+        );
+        None
     }
+}
+
+/// Extracts a UTF-8 debug name from a null-terminated byte string.
+fn extract_debug_name(name: &[u8]) -> Option<String> {
+    let name_end = name.iter().position(|&b| b == 0)?;
+    String::from_utf8(name[..name_end].to_vec()).ok()
+}
+
+/// Encodes a GUID (as found in the binary) into the Microsoft symbol server format.
+fn encode_guid(bytes: &[u8; 16]) -> String {
+    // Reverse bytes for the first parts per GUID specification.
+    hex::encode([
+        bytes[3], bytes[2], bytes[1], bytes[0], bytes[5], bytes[4], bytes[7], bytes[6], bytes[8],
+        bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ])
+    .to_uppercase()
 }
